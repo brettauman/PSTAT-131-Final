@@ -1,0 +1,726 @@
+---
+title: "Bracketology Modeling for the NCAA Men's Basketball March Madness Tournament"
+author: "Brett Goldman"
+date: "12/6/2022"
+output: 
+  html_document:
+    toc: yes
+    toc_depth: 3
+    df_print: paged
+    code_folding: hide
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+![Some people have hobbies. I watch college basketball](images/jonrothsteinhobbies.png)
+
+We are trying to design a machine learning model that can predict which NCAA Men's Basketball Teams would earn a bid to the post-season March Madness Tournament. Our dataset is downloaded from kaggle, and it includes data from every NCAA Division 1 Men's Basketball Team since 2013. 
+
+## Loading Packages: # tidymodels_prefer()
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(ggplot2)
+library(corrplot)
+library(dplyr)
+library(corrr)
+library(ISLR)
+library(ISLR2)
+library(MASS)
+library(discrim)
+library(vip)
+library(rpart.plot)
+library(ranger)
+tidymodels_prefer()
+```
+
+## Context on NCAA Tournament Format
+
+The NCAA Division 1 Men's Basketball Tournament, more commonly known as March Madness, is a 68-team postseason tournament held after the end of the NCAA College Basketball regular season to determine who will be the National Champion. 8 teams compete in 4 "First 4" games to determine the last four spots to make the 64-team bracket. 
+
+Teams can qualify for March Madness in one of two ways: The simplest way for a team to make the tournament is to win their conference, thus earning an automatic bid. Teams that do not win their conference tournament leave their postseason destiny in the hands of the NCAA Selection Committee, who decides which teams will earn the remaining spots with an at-large bid to the tournament. These teams must be in or above the so-called "Bubble" every year in order to make it. 
+
+Every year, Bracketologists (people who predict the bracket for a living) try to use statistics and trends to determine who the at-large teams will be and in what order every team will be seeded. Nobody outside of that committee knows exactly what teams will be in the tournament until the bracket comes out on Selection Sunday.
+
+## Relevance
+
+Not only will this model be a good tool for predicting the at-large teams, but it will also be a good tool to just see who the best teams in college basketball are. If a team is good, my model should be able to make the tournament. Bracketology is something that has become more and more accessible as sports analytics are becoming more and more popular. This project should provide a lot of useful information on the college basketball season. 
+
+![Bracketology](images/bracketology.jpeg)
+
+## My Goal
+
+My goal is to make a model that predicts whether a team is good enough to make March Madness based on several metrics that I will explain in just a bit. By the time this model is done, I'm expecting that I will be able to put in the stats from any team in the past 10 seasons and see whether they are good enough to make the tournament. I'm also expecting that my model will have a very high success/accuracy rate, since it should recognize that most teams do not make the tournament. If it simply guesses no for every single team, it can still have about an 80% success rate since most teams don't make the tournament.
+
+# Exploratory Data Analysis
+
+## Loading the Data:
+```{r}
+NCAAData<-read.csv(file="~/Documents/School/PSTAT 131/NCAABasketball.csv")
+```
+
+I personally went through the file and added in the column CONF_CHAMP, which states whether a team won their conference and thus received an automatic bid to the tournament. For whatever reason, 2021 Gonzaga's CONF_CHAMP column didn't translate from the csv to the R data frame, so I need to add that in:
+
+```{r}
+NCAAData[359, 3] <- 1 # Don't know what's wrong with 2021 Gonzaga's data
+```
+
+## Changing the Data
+
+Now, we need to make the POSTSEASON column say NA for every team that did not make the tournament:
+```{r}
+NCAAData$POSTSEASON<-ifelse(NCAAData$POSTSEASON=="", NA, NCAAData$POSTSEASON) # replacing blanks with NAs
+```
+And let's replace the NAs with 0s for CONF_CHAMP
+```{r}
+NCAAData$CONF_CHAMP[is.na(NCAAData$CONF_CHAMP)]<-0
+```
+Now, let's add a TOURNEY_BOUND column that will serve to tell us whether the team made the tournament or not:
+```{r}
+NCAA_Teams<-NCAAData %>% 
+  mutate(TOURNEY_BOUND=case_when(is.na(POSTSEASON)~0,
+                                 !is.na(POSTSEASON)~1))
+```
+
+Finally, let's take out all Conference Champions. We already know that teams who win their conference make the tournament, so we're just worried about predicting at-large teams.
+
+```{r}
+NCAA_Teams<-NCAA_Teams %>% 
+  filter(CONF_CHAMP==0)
+```
+
+Now that we have all the teams we want in our data set, let's remove the CONF_CHAMP column, because none of these teams are conference champions. We can also remove the SEED and POSTSEASON columns because we don't care what seed they are in the tournament or how far they went, we just care whether they make it or not.
+
+From my prior knowledge of these statistics, we are also going to take out the EFG_O, EFG_D, X3P_O, X3P_D, X2P_O and X2P_D metrics. They all relate to each other and they are essentially covered in ADJOE and ADJDE anyways, so no need to double dip and risk collinearity.
+
+We're also going to take away Wins and Games. I was hesitant to remove these variables because I did not want a team that played very few games making it into the tournament, but after some exploring I found that there haven't been any cases of quality teams playing a severe deficit of games in the past 10 years.
+
+There are two metrics that determine simply how good a team is compared to everyone else: WAB and BARTHAG. These two variables are collinear, so in order to avoid that, I am deciding to use BARTHAG. I think it's a better metric to use in this case because every team that makes the tournament should in theory have a WAB over 1, while BARTHAG is competing against the average, which includes teams not in the tournament.
+
+```{r}
+NCAA_Teams<-NCAA_Teams %>%
+  select(-SEED, -CONF_CHAMP, -POSTSEASON, -EFG_O, -EFG_D, -X3P_O, -X3P_D, -X2P_O, -X2P_D, -W, -G, -WAB)
+```
+
+## Tidying the Data
+
+Now, let's look at our data set:
+```{r}
+dim(NCAA_Teams)
+```
+
+We have a data set with 2874 observations and 14 variables. Here are the variables we will be using:
+
+TEAM: The school that the team plays for.
+CONF: What Division 1 Conference the team plays in. We're not gonna use it in the models because strength of schedule is already baked into the stats. But we'll do some EDA with it because there'll be some fun things to learn.
+ADJOE: Adjusted Offensive Efficiency. Points per 100 possessions a team would score against the average defense. Higher numbers indicate better offenses.
+ADJDE: Adjusted Defensive Efficiency. Points per 100 possessions a team would allow against the average offense. Lower numbers indicate better defenses.
+BARTHAG: Power Rating, the chances of beating an average D1 team. Higher numbers are better. 
+TOR: Turnover (TO) Rate. Measures how often a team's offense turns the ball over . Lower numbers are better.
+TORD: Turnover (TO) Rate Forced. Measures how often a team's defense turns over the other team. Higher numbers are better.
+ORB: Offensive Rebound (ORB) Rate. How often does a team secure an offensive rebound. Higher numbers are better.
+DRB: Offensive Rebound Rate Allowed. How often does a team allow an offensive rebound. Lower numbers are better.
+FTR: Free Throw (FT) Rate. How often a team shoots Free Throws. Higher numbers indicate a team's offense goes to the foul line more often and are typically better.
+FTRD: Free Throw (FT) Rate Allowed. How often a team gives up Free Throws. Lower numbers indicate a team's defense sends the opposing offense to the foul line less often and are typically worse.
+ADJ_T: Adjusted Tempo. How many possessions per 40 minutes (the length of an NCAA college basketball game) a team would have playing against the average D1 team. Higher numbers indicate an up-tempo, push-the-pace team. Low numbers indicate a slower-paced, grind-it-out team.
+YEAR: Year that the tournament takes place. For example, the 2015-2016 NCAA Season will have year 2016, since the tournament took place in March 2016.
+TOURNEY_BOUND: 1 indicates if the team makes the tournament, and 0 indicates if the team does not make the tournament. This is what we will be predicting.
+
+
+Let's make sure our three categorical variables (CONF, YEAR, and TOURNEY_BOUND) are factors.
+```{r}
+NCAA_Teams$YEAR<-as.factor(NCAA_Teams$YEAR)
+NCAA_Teams$TOURNEY_BOUND<-as.factor(NCAA_Teams$TOURNEY_BOUND)
+NCAA_Teams$CONF<-as.factor(NCAA_Teams$CONF)
+levels(NCAA_Teams$YEAR)
+levels(NCAA_Teams$TOURNEY_BOUND)
+levels(NCAA_Teams$CONF)
+```
+
+# Exploratory Data Analysis
+
+We're now going to look at the relationships between our variables. We especially want to see if any variables have a heavy impact on TOURNEY_BOUND.
+
+## Correlation
+
+Let's take a look at the correlation between these predictor variables:
+```{r}
+NCAA_Data_Numeric<-NCAA_Teams %>% 
+  select_if(is.numeric)
+
+NCAA_cor<-cor(NCAA_Data_Numeric)
+NCAA_corrplot<-corrplot(NCAA_cor, method='square', order='AOE')
+
+```
+
+With that in mind, this correlation plot makes sense based on my prior knowledge of basketball. There is high correlation within all of the offensive stats and all of the defensive stats.
+
+Every part of a basketball game will affect all the stats in some way, so it makes sense that most variables have correlation with others, whether it be small/large or negative/positive. However, it is good to see that two fairly unrelated variables such as FTR and ADJ_T have very little correlation.
+
+After looking at the correlation matrix, I have decided to remove BARTHAG. It seems like this metric is very highly correlated with ADJOE and ADJDE, so in order to avoid collinearity, we will remove it. ADJOE and ADJDE both already take into account the stats against the 'average' team, so BARTHAG is basically just already using these stats in it's calculation. It will likely be too overpowering if we try and use it anyway.
+
+```{r}
+NCAA_Teams<-NCAA_Teams %>%
+  select(-BARTHAG)
+```
+
+```{r}
+NCAA_Data_Numeric<-NCAA_Teams %>% 
+  select_if(is.numeric)
+
+NCAA_cor<-cor(NCAA_Data_Numeric)
+NCAA_corrplot<-corrplot(NCAA_cor, method='square', order='AOE')
+```
+
+```{r}
+dim(NCAA_Teams)
+```
+Now we have 13 variables. Let's see how the distribution of some of our variables look with TOURNEY_BOUND to see any potential patterns.
+
+## Adjusted Offense
+```{r}
+ggplot(NCAA_Teams, aes(ADJOE))+
+  geom_bar(aes(fill=TOURNEY_BOUND)) + 
+  scale_fill_manual(values=c('blue', 'gold'))
+```
+
+## Adjusted Defense
+```{r}
+ggplot(NCAA_Teams, aes(ADJDE))+
+  geom_bar(aes(fill=TOURNEY_BOUND)) + 
+  scale_fill_manual(values=c('blue', 'gold'))
+```
+
+As expected, teams with high offensive ratings and teams with low defensive ratings tend to make the playoffs. Now, let's get into some of the more interesting metrics to see where they stand.
+
+## Free Throw Rate
+```{r}
+ggplot(NCAA_Teams, aes(FTR))+
+  geom_bar(aes(fill=TOURNEY_BOUND)) + 
+  scale_fill_manual(values=c('blue', 'gold'))
+```
+
+Contrary to my belief, a high free throw rate does not necessarily indicate that a team will make the tournament, it's pretty evenly spread out. Let's see if the defensive side of this stat gives us the same results.
+
+## Free Throw Rate (Defensive)
+```{r}
+ggplot(NCAA_Teams, aes(FTRD))+
+  geom_bar(aes(fill=TOURNEY_BOUND)) + 
+  scale_fill_manual(values=c('blue', 'gold'))
+```
+
+This is more of what I was expecting. It's more centered than I thought it would be, but teams allowing a lower FTR tend to be better defensively and thus make the tournament more often.
+
+## Turnover Rate (Offense)
+```{r}
+ggplot(NCAA_Teams, aes(TOR))+
+  geom_bar(aes(fill=TOURNEY_BOUND)) + 
+  scale_fill_manual(values=c('blue', 'gold'))
+```
+
+## Turnover Rate (Defense)
+```{r}
+ggplot(NCAA_Teams, aes(TORD))+
+  geom_bar(aes(fill=TOURNEY_BOUND)) + 
+  scale_fill_manual(values=c('blue', 'gold'))
+```
+Teams that turn the ball over a lot tend to not make the tournament as often. That shouldn't come to the surprise of anyone. What IS a surprise, at least to me, is that FORCING more turnovers of your opponent does not translate to a better chance of making the tournament. I would think that the teams that are best at forcing turnovers would be the best defensively, and would thus win more games. It appears that my thought process is wrong, though.
+
+## Offensive Rebound Rate
+
+```{r}
+ggplot(NCAA_Teams, aes(ORB))+
+  geom_bar(aes(fill=TOURNEY_BOUND)) + 
+  scale_fill_manual(values=c('blue', 'gold'))
+```
+
+## Offensive Rebound Rate Allowed
+```{r}
+ggplot(NCAA_Teams, aes(DRB))+
+  geom_bar(aes(fill=TOURNEY_BOUND)) + 
+  scale_fill_manual(values=c('blue', 'gold'))
+```
+These are a little more centered than I would think, but it is consistent with the general saying that "Rebounds Win Rings". The teams that get the most offensive rebounds are able to get more scoring opportunities, and those that give up offensive rebounds give up scoring opportunities and are thus the worse teams. It's no wonder that rebounding makes coaches sweat.
+
+## Tempo
+```{r}
+ggplot(NCAA_Teams, aes(ADJ_T))+
+  geom_bar(aes(fill=TOURNEY_BOUND)) + 
+  scale_fill_manual(values=c('blue', 'gold'))
+```
+
+As I expected, a team's tempo doesn't really directly correlate to making the tournament. It's believed that a team can be successful with either a high-paced scheme and a low-paced scheme, so this plot confirms conventional wisdom.
+
+It's clear from our EDA that high ADJOE and low ADJDE are very highly correlated with teams that make the tournament, and that other variables don't matter as much. However, predicting how good a basketball team is without utilizing how good they are on offense and defense is like judging a car's performance without looking at the engine. Offense and Defense is what drives basketball teams.
+
+## Conference Representation
+
+I am curious to see what conferences are the most represented amongst at-large teams and what conferences have the most final 4 appearances since 2013. These won't impact the models, but it's just interesting trivia to know.
+
+```{r}
+NCAA_Tournament_Teams<-NCAA_Teams %>% 
+  filter(TOURNEY_BOUND==1)
+ggplot(NCAA_Tournament_Teams, aes(CONF))+
+  geom_bar()
+```
+
+The Big 10 and ACC, widely known as two of the most prolific basketball conferences, have had the most at-large bids to the tournament since 2013. The Ohio Valley Conference and Sun Belt, two mid-major conferences, have barely any at-large bids in that time frame. Even though being in a bigger conference seems like it has a significant impact on making the tournament, it's not going to be as useful for our purposes. We're trying to find the best teams based off of the stats, so we don't want a team's conference to get in the way of our model's analysis.
+
+
+## Final 4 Teams By Conference
+
+```{r}
+NCAA_Final_Four_Teams<-NCAAData %>% 
+  filter(POSTSEASON=='F4')
+ggplot(NCAA_Final_Four_Teams, aes(CONF))+
+  geom_bar()
+```
+
+Since 2013, no conference has had more than 4 teams make the Final 4, which is surprising to me. The SEC leads the pack, with 4 teams (Auburn, South Carolina, Kentucky, Florida).
+
+
+## Appearances By School
+
+A Bar Chart is not going to be readable since there's over 300 teams in the NCAA. So, let's just look at who has the most tournament appearances since 2013.
+
+```{r}
+NCAA_Appearances<-NCAAData %>% 
+  mutate(TOURNEY_BOUND=case_when(is.na(POSTSEASON)~0,
+                                 !is.na(POSTSEASON)~1)) %>%
+  filter(TOURNEY_BOUND==1)
+NCAA_Appearances<-NCAA_Appearances %>% 
+  group_by(TEAM) %>% 
+  summarise(Total_Appearances=sum(TOURNEY_BOUND)) %>% 
+  arrange(desc(Total_Appearances))
+head(NCAA_Appearances)
+```
+Only 5 schools have made the NCAA Men's Basketball Tournament in every season since 2013: Gonzaga, Kansas, Michigan State, UNC, and Villanova (A Fortune 500 Company).
+
+![Villanova Basketball. A Fortune 500 Company.](images/novafortune500.jpeg)
+
+Okay, that's enough fun looking at the past, let's get to modeling.
+
+# Modeling Time
+
+Now that we're familiar with our predictors and the relationships they have with each other and the response, it's time to set up the model we will be using. I've decided to used an 70/30 split for our data. Stratify on our response variable TOURNEY_BOUND to avoid bias. Because this is a binary classification project, I will use area under the ROC curve as my performance measure of choice.
+
+![And Here. We. Go.](images/andherewego.png)
+
+## Split
+```{r}
+set.seed(2022) 
+
+NCAA_split<-initial_split(NCAA_Teams, prop=0.7, strata=TOURNEY_BOUND)
+NCAA_train<-training(NCAA_split)
+NCAA_test<-testing(NCAA_split)
+dim(NCAA_train)
+dim(NCAA_test)
+```
+
+## Recipe
+
+We will dummy code all of our nominal predictors so they're interpreted correctly as well as center and scale all of our predictors in order to normalize them.
+```{r}
+NCAA_recipe<-recipe(TOURNEY_BOUND~ADJOE+ADJDE+TOR+
+                      TORD+ORB+DRB+FTR+FTRD+ADJ_T+YEAR,
+                    data=NCAA_train) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())# normalized predictors
+```
+
+## K-Fold Cross Validation
+
+For this project's cross validation, we divide the data into 10 groups (folds). We hold out one group at a time as the validation set, then our models are fit on the remaining 9 groups. The ROC_AUC is then computed for the validation set. This process is repeated 10 times, with each group being the validation set one time. 
+```{r}
+NCAA_folds<-vfold_cv(NCAA_train, v=10, strata = TOURNEY_BOUND) # 10-fold cross validation
+keep_pred <- control_resamples(save_pred = TRUE, save_workflow = TRUE)
+```
+
+I have decided to run the following models in employ to get a wide range of strategies that we have learned over the course of the quarter:
+* Logistic Regression
+* Linear Discriminant Analysis (LDA)
+* Quadratic Discriminant Analysis (QDA)
+* Lasso
+* Decision Tree
+* Random Forest
+
+Based on the performance of our labs and homeworks, I'm expecting logistic regression or random forest to do the best while Pruned Tree brings up the rear. Just like the NCAA Tournament, we play the games so that we know the results. Let's get to it.
+
+## Logistic Regression Model:
+```{r warning=FALSE}
+NCAA_log_reg<-logistic_reg() %>% 
+  set_engine('glm') %>% 
+  set_mode('classification')
+NCAA_log_wkflow <- workflow() %>% 
+  add_model(NCAA_log_reg) %>% 
+  add_recipe(NCAA_recipe)
+NCAA_log_fit <- fit(NCAA_log_wkflow, NCAA_train) 
+
+NCAA_res_log<-NCAA_log_wkflow %>% 
+  fit_resamples(resamples = NCAA_folds, control = keep_pred) # We'll use these later
+```
+
+## Linear Discriminant Analysis (LDA) Model:
+```{r warning=FALSE}
+NCAA_lda_mod <- discrim_linear() %>% 
+  set_mode("classification") %>% 
+  set_engine("MASS")
+
+NCAA_lda_wkflow <- workflow() %>% 
+  add_model(NCAA_lda_mod) %>% 
+  add_recipe(NCAA_recipe)
+
+NCAA_lda_fit <- fit(NCAA_lda_wkflow, NCAA_train)
+
+NCAA_res_lda<-NCAA_lda_wkflow %>% 
+  fit_resamples(resamples = NCAA_folds, control = keep_pred) # We'll use these later
+```
+
+## Quadratic Discriminant Analysis (QDA) Model:
+```{r warning=FALSE}
+NCAA_qda_mod <- discrim_quad() %>% 
+  set_mode("classification") %>% 
+  set_engine("MASS")
+
+NCAA_qda_wkflow <- workflow() %>% 
+  add_model(NCAA_qda_mod) %>% 
+  add_recipe(NCAA_recipe)
+
+NCAA_qda_fit <- fit(NCAA_qda_wkflow, NCAA_train)
+
+NCAA_res_qda<-NCAA_qda_wkflow %>% 
+  fit_resamples(resamples = NCAA_folds, control = keep_pred) # We'll use these later
+```
+
+## Lasso Model:
+```{r warning=FALSE}
+NCAA_lasso_recipe <- 
+  recipe(formula = TOURNEY_BOUND ~ ADJOE+ADJDE+TOR+
+           TORD+ORB+DRB+FTR+FTRD+ADJ_T+YEAR, data = NCAA_train) %>% 
+  step_novel(all_nominal_predictors()) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
+
+NCAA_lasso_spec <-
+  multinom_reg(penalty = tune(), mixture = 1) %>% # mixture=1 indicates lasso
+  set_mode("classification") %>% 
+  set_engine("glmnet") 
+
+NCAA_lasso_workflow <- workflow() %>% 
+  add_recipe(NCAA_lasso_recipe) %>% 
+  add_model(NCAA_lasso_spec)
+```
+
+```{r}
+NCAA_penalty_grid <- grid_regular(penalty(range = c(-5, 5)), levels = 50)
+# -5 to 5 ensures we get a really wide range
+NCAA_lasso_tune_res <- tune_grid(
+  NCAA_lasso_workflow,
+  resamples = NCAA_folds, 
+  grid = NCAA_penalty_grid
+)
+
+NCAA_lasso_best_penalty <- select_best(NCAA_lasso_tune_res, metric = "roc_auc")
+NCAA_lasso_final<-finalize_workflow(NCAA_lasso_workflow, NCAA_lasso_best_penalty)
+NCAA_lasso_final_fit<-fit(NCAA_lasso_final, data=NCAA_train)
+autoplot(NCAA_lasso_tune_res)
+```
+In general, the lower the penalty, the higher the accuracy and ROC_AUC. The ROC_AUC tends to fall off significantly as it approaches 0.01. I chose 50 levels because I know it would fit with my computing power and we've used it for prior labs with similar data structures.
+
+## Pruned Decision Tree:
+```{r warning=FALSE}
+NCAA_tree_spec <- decision_tree() %>%
+  set_engine("rpart")
+NCAA_class_tree_spec <- NCAA_tree_spec %>%
+  set_mode("classification")
+NCAA_class_tree_wf <- workflow() %>%
+  add_model(NCAA_class_tree_spec %>% set_args(cost_complexity = tune())) %>%
+  add_recipe(NCAA_recipe)
+NCAA_tree_param_grid<-grid_regular(cost_complexity(range=c(-3, -1)), levels=10) 
+```
+
+The range and levels were taken from our labs and homeworks. These are values that I know my computer can handle in a reasonable amount of time, and they make sense given the nature and size of my dataset. 
+
+```{r}
+NCAA_tree_tune_res<-tune_grid(
+  NCAA_class_tree_wf,
+  resamples=NCAA_folds,
+  grid=NCAA_tree_param_grid,
+  metrics=metric_set(roc_auc)
+)
+```
+
+```{r}
+autoplot(NCAA_tree_tune_res)
+```
+ROC_AUC appears to peak at a Cost-Complexity value just under 0.01. ROC_AUC really drops off after about 0.05 Cost-Complexity value. 
+
+```{r warning=FALSE}
+NCAA_class_tree_final<-finalize_workflow(NCAA_class_tree_wf, select_best(NCAA_tree_tune_res))
+NCAA_class_tree_final_fit<-fit(NCAA_class_tree_final, data=NCAA_train)
+NCAA_class_tree_final_fit %>% 
+  extract_fit_engine() %>% 
+  rpart.plot()
+```
+It appears as though ADJOE and ADJDE really impact the response more than any other variable. We'll take a look at the variable importance plot in a bit when we get to Random Forest. I think these predictors being so important could limit the accuracy of the pruned tree, which is why I believed the pruned tree would be one of the worst. At the bubble line, the stats are so similar that I think it will be tough for the model to differentiate between the teams that make it and the teams that don't.
+
+## Random Forest:
+
+```{r}
+NCAA_forest_spec<-rand_forest() %>% 
+  set_engine('ranger', importance='impurity') %>% 
+  set_mode('classification') %>% 
+  set_args(mtry=tune(),
+           trees=tune(),
+           min_n=tune())
+NCAA_forest_wf<-workflow() %>% 
+  add_model(NCAA_forest_spec) %>% 
+  add_recipe(NCAA_recipe)
+NCAA_forest_param_grid<-grid_regular(mtry(range=c(1, 10)),
+                         min_n(range=c(10, 50)),
+                         trees(range=c(1, 10)), levels=5)
+NCAA_forest_tune_res<-tune_grid(
+  NCAA_forest_wf,
+  resamples=NCAA_folds,
+  grid=NCAA_forest_param_grid,
+  metrics=metric_set(roc_auc)
+)
+```
+
+For mtry, 1 to 10 needs to be the range because 1 is the minimum and 10 is the maximum number of predictors. 
+For min_n and trees, 10 to 50 and 1 to 10 makes sense based on our data size and computing power. We don't really need too many trees since our model accuracy isn't going to be affected drastically. It's going to be really accurate regardless and having more trees will just take more computing power.
+
+```{r}
+autoplot(NCAA_forest_tune_res)
+```
+In general, it appears that as the number of predictors increases, ROC_AUC increases. As the minimal node size increases, the ROC_AUC also tends to increase. It's hard to tell which minimal node size and which number of trees yields better ROC_AUC since they're all so close together, so I'm gonna see what the best one really is.
+
+```{r}
+NCAA_best_forest<-NCAA_forest_tune_res %>% 
+  collect_metrics() %>%
+  arrange(desc(mean))
+NCAA_best_forest<-NCAA_best_forest[1,]
+NCAA_best_forest
+```
+
+```{r}
+NCAA_forest_spec<-rand_forest() %>% 
+  set_engine('ranger', importance='impurity') %>% 
+  set_mode('classification') %>% 
+  set_args(mtry=7,
+           trees=10,
+           min_n=50)
+NCAA_forest_fit<-fit(NCAA_forest_spec, TOURNEY_BOUND~ADJOE+ADJDE+TOR+
+                             TORD+ORB+DRB+FTR+FTRD+ADJ_T+YEAR, data=NCAA_train)
+NCAA_forest_final<-finalize_workflow(NCAA_forest_wf, select_best(NCAA_forest_tune_res))
+NCAA_forest_final_fit<-fit(NCAA_forest_final, data=NCAA_train)
+```
+
+```{r}
+vip(NCAA_forest_fit)
+```
+It's not THAT MUCH of a surprise, but offensive and defensive efficiency are by far the best indicators of whether a team will make the tournament or not. What is more surprising is that offense is so much more important than defense. Thus, really bad offensive teams with really good defense have a worst chance of making the tournament than really good offensive teams with really bad defense. The explanation is probably as simple as "you need to score to win" and teams with good offenses can overcome bad defensive games, but teams with bad offenses can't overcome defensive slips that happen to even the best defensive teams.
+
+Turnover Rate being the next highest importance should not be a shock to anyone who knows about basketball. Teams that turn the ball over a lot give the other team more opportunities to score and have less opportunities to score themselves. It's why basketball coaches are so angry whenever their team can't take care of the ball.
+
+Year being the least important variable makes sense. The actual year should not have that much of an impact when the sample size of games is so large every year and over the course of 10 years.
+
+It's evident that ADJOE and ADJDE overpower the other 8. Offense and defense are the two most important parts of the game. I did try to do this project without those two variables, but even though they are overpowering, I believe that I would be doing a disservice to myself and it would go against the spirit of my project if I did not go for the most accurate models possible. I'm trying to predict whether a team will make the tournament or not, it doesn't make sense to not consider the two variables that are most important for that.
+
+# Finding Fit
+
+As I explained earlier, Area Under the ROC Curve is the best way to determine model performance for binary classifiers, which is what we're working with here. Let's see what model performed the best.
+
+```{r}
+NCAA_train_log_roc_auc<-collect_metrics(NCAA_res_log)$mean[2]
+```
+
+```{r}
+NCAA_train_lda_roc_auc<-collect_metrics(NCAA_res_lda)$mean[2]
+```
+
+```{r}
+NCAA_train_qda_roc_auc<-collect_metrics(NCAA_res_qda)$mean[2]
+```
+
+```{r}
+NCAA_train_lasso_roc_auc<-augment(NCAA_lasso_final_fit, new_data=NCAA_train) %>% 
+  roc_auc(TOURNEY_BOUND, estimate=.pred_0) %>% 
+  select(.estimate)
+```
+
+```{r}
+NCAA_train_tree_roc_auc<-augment(NCAA_class_tree_final_fit, new_data=NCAA_train) %>% 
+  roc_auc(TOURNEY_BOUND, estimate=.pred_0) %>% 
+  select(.estimate)
+```
+
+```{r}
+NCAA_train_forest_roc_auc<-augment(NCAA_forest_final_fit, new_data=NCAA_train) %>% 
+  roc_auc(TOURNEY_BOUND, estimate=.pred_0) %>% 
+  select(.estimate)
+```
+
+# Post-Fit Analysis
+```{r}
+modelnames<-c("Logistic Regression", "LDA", "QDA", "Lasso", "Pruned Tree", "Random Forest")
+```
+
+```{r}
+rocaucvalues<-data.frame('ROC_AUC'=c(NCAA_train_log_roc_auc, 
+                                     NCAA_train_lda_roc_auc,
+                                     NCAA_train_qda_roc_auc,
+                                     NCAA_train_lasso_roc_auc$.estimate,
+                                     NCAA_train_tree_roc_auc$.estimate,
+                                     NCAA_train_forest_roc_auc$.estimate), 
+                         row.names=modelnames)
+rocaucvalues
+```
+Our Random Forest Model yielded the best results.
+
+```{r}
+show_best(NCAA_forest_tune_res, metric='roc_auc') %>% 
+  select(-.estimator, .config) %>% 
+  slice(1)
+```
+
+That ROC_AUC value is superb. With that number, I would say our model does as good of a job as the committee does at selecting. Now, let's look at this model with our testing data.
+
+```{r}
+NCAA_forest_roc_curve<-augment(NCAA_forest_final_fit, new_data = NCAA_test) %>% 
+  roc_curve(TOURNEY_BOUND, estimate=.pred_0)
+autoplot(NCAA_forest_roc_curve)
+```
+
+A perfect ROC curve would be a complete right angle at the top left corner. While we're not quite there, we're very close. This is expected based on our ROC_AUC value on the testing set.
+
+```{r}
+NCAA_test_forest_roc_auc<-augment(NCAA_forest_final_fit, new_data=NCAA_test) %>% 
+  roc_auc(TOURNEY_BOUND, estimate=.pred_0) %>% 
+  select(.estimate)
+NCAA_test_forest_roc_auc
+```
+Our model stands the test of our testing set. It's still insanely accurate, which is exactly what I expected.
+
+```{r}
+augment(NCAA_forest_final_fit, new_data = NCAA_test) %>%
+  conf_mat(truth = TOURNEY_BOUND, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+Our model correctly predicts a lot of no's and not a lot of yes's. Most of our incorrect predictions are going to be along the bubble line, which is expected because it really is tought to decide between teams that are so close together.
+
+# Examples From the Past
+
+## Scott Drew. Evolution.
+
+![Scott Drew. Evolution](images/ScottDrewEvolution.jpeg)
+
+First, I'll give a layup. 2022 Baylor was a 1 seed in the tournament despite being an at-large team, so they should make the tournament comfortably here:
+
+```{r}
+predict(NCAA_forest_final_fit, NCAA_Teams[2,], type='class') # 2022 Baylor
+```
+Good to know our model can make a layup.
+
+## UCSB's Disappointing 2022 Campaign
+
+Let's see if UCSB, who wasn't close to being a tournament team last season, would have made it if my model was in charge:
+```{r}
+predict(NCAA_forest_final_fit, NCAA_Teams[119,], type='class') # 2022 UC Santa Barbara
+```
+
+Sadly, not even a UCSB student's fictitious model could get us into the tournament last season :(.
+
+## The Bubble Teams
+### 2021
+Every year, the committee releases it's "First 4 Out" and "Last 4 In", which is the list of 4 teams that *barely* missed the tournament and 4 teams that *barely* made it in. In the 2021 season, the First 4 Out were Louisville, Colorado State, Saint Louis, and Ole Miss. The Last 4 In were Michigan State, UCLA, Wichita State, and Drake. Let's see if any of them would've made the tournament with my model.
+
+```{r}
+UCLA2021<-predict(NCAA_forest_final_fit, NCAA_Teams[338,],
+                  type='class')$.pred_class # 2021 UCLA
+MichSt2021<-predict(NCAA_forest_final_fit, NCAA_Teams[374,], 
+                    type='class')$.pred_class # 2021 MSU
+WichitaSt2021<-predict(NCAA_forest_final_fit, NCAA_Teams[384,], 
+                       type='class')$.pred_class # 2021 WICH
+Drake2021<-predict(NCAA_forest_final_fit, NCAA_Teams[392,], 
+                   type='class')$.pred_class # 2021 Drake
+Louisville2021<-predict(NCAA_forest_final_fit, NCAA_Teams[377,], 
+                        type='class')$.pred_class # 2021 LOU
+ColoradoSt2021<-predict(NCAA_forest_final_fit, NCAA_Teams[396,], 
+                        type='class')$.pred_class # 2021 CSU
+SaintLouis2021<-predict(NCAA_forest_final_fit, NCAA_Teams[369,],
+                        type='class')$.pred_class # 2021 Saint Louis
+OleMiss2021<-predict(NCAA_forest_final_fit, NCAA_Teams[365,], 
+                     type='class')$.pred_class # 2021 Miss
+Bubbleteams2021<-c('2021 UCLA (Made)', '2021 Michigan State (Made)', 
+                   '2021 Wichita State (Made)', '2021 Drake (Made)', 
+                   '2021 Louisville (Missed)', '2021 Colorado State (Missed)', 
+                   '2021 Saint Louis (Missed)', '2021 Ole Miss (Missed')
+Bubble2021<-data.frame('TourneyBound'=c(UCLA2021, MichSt2021, WichitaSt2021, Drake2021,
+                                          Louisville2021, ColoradoSt2021, SaintLouis2021,
+                                          OleMiss2021),
+                       row.names=Bubbleteams2021)
+Bubble2021
+```
+This isn't great accuracy. Let's check out 2022's bubble to see if we do better.
+
+### 2022
+
+![First Four In and Last Four Out 2022](images/2022bubble.jpg)
+
+
+```{r}
+Wyoming2022<-predict(NCAA_forest_final_fit, NCAA_Teams[60,], 
+                     type='class')$.pred_class # 2022 WYO
+Indiana2022<-predict(NCAA_forest_final_fit, NCAA_Teams[20,], 
+                     type='class')$.pred_class # 2022 IND
+Rutgers2022<-predict(NCAA_forest_final_fit, NCAA_Teams[62,],
+                     type='class')$.pred_class # 2022 RUTG
+NotreDame2022<-predict(NCAA_forest_final_fit, NCAA_Teams[28,], 
+                       type='class')$.pred_class # 2022 ND
+Dayton2022<-predict(NCAA_forest_final_fit, NCAA_Teams[34,], 
+                    type='class')$.pred_class # 2022 DAY
+Oklahoma2022<-predict(NCAA_forest_final_fit, NCAA_Teams[21,], 
+                      type='class')$.pred_class # 2022 OU
+SMU2022<-predict(NCAA_forest_final_fit, NCAA_Teams[45,],
+                 type='class')$.pred_class # 2022 SMU
+TAMU2022<-predict(NCAA_forest_final_fit, NCAA_Teams[24,],
+                  type='class')$.pred_class # 2022 TAMU
+BubbleTeams2022<-c('2022 Wyoming (Made)', '2022 Indiana (Made)', 
+                   '2022 Rutgers (Made)', '2022 Notre Dame (Made)', 
+                   '2022 Dayton (Missed)', '2022 Oklahoma (Missed)', 
+                   '2022 SMU (Missed)', '2022 Texas A&M (Missed)')
+Bubble2022<-data.frame("Tourney Bound"=c(Wyoming2022, Indiana2022,
+                                         Rutgers2022, NotreDame2022,
+                                         Dayton2022, Oklahoma2022,
+                                         SMU2022, TAMU2022),
+                             row.names=BubbleTeams2022)
+Bubble2022
+```
+That's also not great. It appears that our model doesn't do a good job when it comes to making tough decisions.
+
+# Conclusion
+
+It appears that my model's ROC_AUC value is...inflated to say the least. It probably gets a high overall grade based on the fact that it correctly predicts that a lot of teams don't make the tournament, and it gets most of the obvious tournament teams correct. However, when it's a close call for bubble teams, it doesn't do much better than any casual college basketball fan would.
+
+The Random Forest model performing the best did not come to a surprise to me. The Random Forest outputs yes or no depending on which has the most trees pointing to it, thus it makes sense that it's the best-performing since it should get the easy ones right. Also, the random forest model really didn't consider many variables outside of ADJOE and ADJDE, so it was easy for it to not mess up if it didn't care about other vairables much. 
+
+I don't think that my model suffers drastically from overfitting, the accuracy is high just because of the number of obvious yes's and no's present. The Decision Tree model performing the worst was a bit surprising seeing as though my model isn't that complex. However, maybe the lack of important variables made it hard to differentiate between teams with similar ADJOE and ADJDE.
+
+I'm not shocked that all of the models got such a high ROC_AUC value. The nature of the data and the project was going to point in that direction. I did go back and run the project without the two most 'important' metrics ADJOE and ADJDE, but it yielded ROC_AUC values in the low 80s and it wasn't doing much better on the bubble teams than the ones I used here. I wanted to make the most accurate model I could, so I stuck with the original gameplan. 
+
+There is a reason that those teams are in the bubble--if they were good enough to be locks for the tournament in any model, they would have better stats or would have received an automatic bid. People are always angry at the committee every year for having some teams in over others. There's such a small difference between those teams that every one of them has a good argument for why they should and should not make it. Who knows what outside factors the committee uses to pick teams?
+
+One direction I could go from here is to go back through this project only using the bubble teams from each season (Last 4 In and First 4 Out). I decided not to do that for this project because this dataset only goes back to 2013, so a sample size of 9*8=72 is not enough for our purposes.
+
+I'm not too hung up on my model not getting bubble teams right when Bracketologists don't get it right half the time. I am thankful that I had the opportunity to work with a dataset that I enjoy and has real life application, even if it didn't turn out to help much. Remember, this is only December. We sleep in May.
+
+![We Sleep In May](images/wesleepinmay.png)
